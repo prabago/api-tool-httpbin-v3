@@ -1,0 +1,132 @@
+pipeline {
+    agent any
+    tools {nodejs "node"}
+    environment {
+        API_NAME = 'api-tool-httpbin'
+        API_VER= 'v3'
+        API_DIR = './apis'
+        APP_DIR = './apps'
+        DEV_ENV = 'local'
+        API_BCK = '/var/lib/jenkins/.wso2apictl/exported/apis/'
+        API_BACKUP = 'false'
+    }
+                  
+    stages {
+         stage('Check OpenAPI Spectral Lint') {
+            steps {
+            sh 'git submodule foreach git checkout master'
+            sh 'git submodule foreach git pull'
+
+                script {
+            try {
+                sh 'spectral lint "./apis/$API_NAME/Meta-information/swagger.yaml" -r ./apim-arq/rules/atc-spectral.yaml --format junit --output ./report.xml'
+            } catch(err) {
+                step([$class: 'JUnitResultArchiver', testResults: './report.xml'])
+                 currentBuild.result = 'FAILURE'
+                throw err
+            }
+             }
+            }
+        }
+
+        stage('Run mock-server') {
+            steps {
+                sh 'docker ps -f name=$API_NAME-$API_VER  -q | xargs --no-run-if-empty docker container stop'
+                sh 'docker container ls -a -fname=$API_NAME-$API_VER -q | xargs -r docker container rm'
+                sh 'docker run --init --rm -it -d --name $API_NAME-$API_VER -v $(pwd):/tmp -P stoplight/prism:4 mock -h 0.0.0.0 "/tmp/apis/$API_NAME-$API_VER/Meta-information/swagger.yaml"'
+            }
+        }
+
+        stage('Post Mock-server task') {
+            environment{
+                MOCK_PORT = sh(script: 'docker port $API_NAME-$API_VER 4010 | cut -d":" -f2', , returnStdout: true).trim()
+  
+                RETRY = '80'
+            }
+            steps {
+                echo "Port to ${MOCK_PORT}"
+                sh 'find $API_DIR/$API_NAME-$API_VER -name "*.yaml" -print | xargs sed -i "s/4010/${MOCK_PORT}/g"'
+            }
+        }
+
+        stage('Pre Task Deployment') {
+            steps {
+                echo "Register to ${DEV_ENV}"
+                sh './apim-arq/scripts/config.sh'
+                echo 'Logging into ${$DEV_ENV}'
+                withCredentials([usernamePassword(credentialsId: 'apim_dev', usernameVariable: 'DEV_USERNAME', passwordVariable: 'DEV_PASSWORD')]) {
+                    sh 'apictl login $DEV_ENV -u $DEV_USERNAME -p $DEV_PASSWORD -k'                        
+                }
+                script{
+                def API_DPL = sh(script: "apictl list apis -e $DEV_ENV |  awk \'{print \$2\"-\"\$3}\' | grep $API_NAME-$API_VER | tr -d '\r'", returnStdout: true).trim()
+                
+                def API_FINAL = "$API_NAME-$API_VER"
+                if (API_DPL == API_FINAL ){
+                   API_BACKUP = 'true'
+                }
+                echo "API_BACKUP---> ${API_BACKUP}"
+                }
+            }
+        }
+    
+        stage('Backup API') {
+            when {
+              expression { API_BACKUP == 'true' }
+             }
+            steps {
+                sh 'apictl export-api -n $API_NAME -v $API_VER -e $DEV_ENV -k --verbose'
+            }
+        }
+            stage('Despliegue proyecto API') {
+            environment{
+                RETRY = '80'
+            }
+            steps {
+                
+                echo "Import API project into ${DEV_ENV}"
+                sh 'apictl vcs deploy -e $DEV_ENV'
+            }
+        }
+
+        stage('Ejecucion de Tests contra Sandbox') {
+            steps {
+                echo 'Token are $TOKEN'
+                echo 'Running tests in $DEV_ENV'
+                sh 'newman run ./tests/$API_NAME.postman_collection.json -d $API_VER -e ./tests/$DEV_ENV.postman_environment.json --reporters cli,junit,htmlextra --reporter-junit-export "postman.xml" -n 1 --reporter-htmlextra-export "newman/report.html" --insecure --bail' 
+            }
+            post
+            {
+                 failure {
+                script {
+                    if (API_BACKUP == 'true')
+                        sh 'apictl import-api -f ${API_BCK}/${DEV_ENV}/${API_NAME}_${API_VER}.zip -e $DEV_ENV -k --preserve-provider --update --verbose'
+                    }
+        }
+            }
+        }
+    }
+    post {
+        always {
+            junit '*.xml'
+            publishHTML (target: [
+              allowMissing: false,
+              alwaysLinkToLastBuild: false,
+              keepAll: true,
+              reportDir: 'newman',
+              reportFiles: 'report.html',
+              reportName: "postman-test"
+            ])
+        }
+        cleanup {
+            sh 'apictl logout $DEV_ENV -k'
+            deleteDir()
+            dir("${workspace}@tmp") {
+                deleteDir()
+            }
+            dir("${workspace}@script") {
+                deleteDir()
+            }
+        }
+        
+    }
+}
